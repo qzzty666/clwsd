@@ -1,136 +1,144 @@
-import requests
-import re
 import argparse
 import urllib3
-import html
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from core.checker import check_url
+from core.loader import load_urls
+from core.output import save_results
+
+from colorama import Fore,Style,init 
+
+init(autoreset=True)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-def extract_title(html_text):
-    match = re.search(r"<title>(.*?)</title>", html_text, re.IGNORECASE | re.DOTALL)
-    if match:
-        title = match.group(1).strip()
-        title = html.unescape(title)
-        title = re.sub(r"\s+", " ", title)
-        return title
-    return "-"
+VERSION = "2.3.0"
 
-def check_url(url,timeout):
-    try:
-        response = requests.get(
-            url,
-            timeout=timeout,
-            verify=False,
-            allow_redirects=True,
-            headers={"User-Agent":"Mozilla/5.0"}
-        )
 
-        if not response.encoding or response.encoding.lower() == "iso-8859-1":
-            response.encoding = response.apparent_encoding
-
-        status_code = response.status_code
-        title = extract_title(response.text)
-        length = len(response.content)
-        server = response.headers.get("Server","-")
-
-        return {
-            "url":url,
-            "status":str(status_code),
-            "title":title,
-            "length":str(length),
-            "server":server,
-        }
-
-    except requests.exceptions.Timeout:
-        return {
-            "url":url,
-            "status":"ERROR",
-            "title":"timeout",
-            "length":"0",
-            "server":"-"
-        }
-
-    except requests.exceptions.ConnectionError:
-        return {
-            "url":url,
-            "status":"ERROR",
-            "title":"connection_error",
-            "length":"0",
-            "server":"-"
-        }
-
-    except  requests.exceptions.RequestException as e:
-        return {
-            "url":url,
-            "status":"ERROR",
-            "title":str(e),
-            "length":"0",
-            "server":"-"
-        }
-
-def load_urls(input_file):
-    urls = []
-
-    with open(input_file,"r",encoding="utf-8") as f:
-        for line in f:
-            url = line.strip()
-            if not url:
-                continue
-            urls.append(url)
-
-    return urls
-
-def save_results(output_file,results):
-    with open(output_file,"w",encoding="utf-8") as f:
-        for item in results:
-            line = f"{item['url']} | {item['status']} | {item['title']} | {item['length']} | {item['server']}"
-            f.write(line+"\n")
-
-def main():
-    print(r"""
-   ____   _                        _ 
+def print_banner():
+    print(
+        rf"""
+   ____   _                        _
   / ___| | | __      __  ___    __| |
  | |     | | \ \ /\ / / / __|  / _` |
  | |___  | |  \ V  V /  \__ \ | (_| |
   \____| |_|   \_/\_/   |___/  \__,_|
 
-                            Clwsd 1.0.0
-""")
-        
+            Clwsd {VERSION} by 骑猪走天涯
+"""
+    )
+
+
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Web 存活探测工具",
         formatter_class=lambda prog: argparse.RawTextHelpFormatter(
-            prog, max_help_position=30 
-        )
+            prog, max_help_position=99
+        ),
     )
-    parser.add_argument("-i","--input",required=True,help="输入URL文件")
-    parser.add_argument("-o","--output",default="alive.txt",help="输出结果文件")
-    parser.add_argument("-t","--timeout",type=int,default=5,help="超时时间,默认5秒")
+    parser.add_argument("-i", "--input", required=True, help="输入URL文件")
+    parser.add_argument("-o", "--output", default="alive.txt", help="输出结果文件")
+    parser.add_argument("-t", "--timeout", type=int, default=5, help="超时时间,默认5秒")
+    parser.add_argument("-a", "--only-alive", action="store_true", help="仅输出存活目标")
+    parser.add_argument("-w", "--workers", type=int, default=10, help="线程数,默认10")
+    parser.add_argument(
+        "-f",
+        "--format",
+        dest="output_format",
+        choices=["txt", "csv", "json"],
+        default="txt",
+        help="输出格式:txt/csv/json,默认txt",
+    )
+    return parser
 
-    args = parser.parse_args()
+def colorize_status(status):
+    if status == "ERROR":
+        return Fore.RED + status +Style.RESET_ALL
 
-    urls = load_urls(args.input)
+    if status.startswith("2"):
+        return Fore.GREEN + status + Style.RESET_ALL
+
+    if status.startswith("3"):
+        return Fore.YELLOW + status + Style.RESET_ALL
+    
+    if status.startswith("4") or status.startswith("5"):
+        return Fore.RED + status + Style.RESET_ALL
+
+    return status
+
+
+def print_result(result):
+    colored_status = colorize_status(result["status"])
+
+    print(
+        f"{result['url']} -> "
+        f"{colored_status} | "
+        f"{result['title']}"
+    )
+
+
+def run_scan(urls, timeout, workers):
     results = []
 
-    for url in urls:
-        result = check_url(url,args.timeout)
-        results.append(result)
-        print(f"{result['url']} -> {result['status']} | {result['title']}")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = []
 
-    save_results(args.output,results)
+        for url in urls:
+            future = executor.submit(check_url, url, timeout)
+            futures.append(future)
 
-    print(f"\n探测结束，共{len(results)}个目标，结果已保存到{args.output}")
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+            except Exception as exc:
+                print(f"任务异常：{exc}")
+                continue
+
+            results.append(result)
+            print_result(result)
+
+    return results
+
+
+def count_alive(results):
+    alive_count = 0
+
+    for item in results:
+        if item["status"] != "ERROR":
+            alive_count += 1
+
+    return alive_count
+
+def validate_args(args):
+    if args.timeout < 1:
+        raise ValueError("超时时间必须大于等于1秒")
+
+    if args.workers < 1:
+        raise ValueError("线程数必须大于等于1")
+
+def main():
+    print_banner()
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        validate_args(args)
+
+        urls = load_urls(args.input)
+        results = run_scan(urls, args.timeout, args.workers)
+
+        save_results(args.output, results, args.output_format, args.only_alive)
+
+        print(f"\n探测结束,共{len(results)}个目标，结果已保存到{args.output}")
+
+        if args.only_alive:
+            alive_count = count_alive(results)
+            print(f"仅输出存活目标：{alive_count}个")
+
+    except ValueError as exc:
+        print(f"参数错误:{exc}")
+
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-                            
-          
-
